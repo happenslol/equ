@@ -8,10 +8,11 @@ import (
 )
 
 type itemType int
-type stateFn func(l *lexer) stateFn
+type lexerStateFn func(l *lexer) lexerStateFn
+type parserStateFn func(l *parser) parserStateFn
 
 const (
-	itemEof itemType = iota
+	itemEOF itemType = iota
 	itemError
 	itemPath
 	itemOr
@@ -33,7 +34,7 @@ const (
 
 func (i itemType) String() string {
 	switch i {
-	case itemEof:
+	case itemEOF:
 		return "eof"
 	case itemError:
 		return "error"
@@ -198,7 +199,7 @@ func (l *lexer) backup() {
 	l.pos -= l.width
 }
 
-func lexFilters(l *lexer) stateFn {
+func lexFilters(l *lexer) lexerStateFn {
 	if string(l.peek()) == tokenBundleStart {
 		return lexToken(tokenBundleStart, itemBundleStart, lexFilters)
 	}
@@ -217,7 +218,7 @@ func lexFilters(l *lexer) stateFn {
 	return lexToken(tokenFiltersStart, itemFiltersStart, lexInsideFilters)
 }
 
-func lexInsideFilters(l *lexer) stateFn {
+func lexInsideFilters(l *lexer) lexerStateFn {
 	if string(l.peek()) == tokenBundleStart {
 		return lexToken(tokenBundleStart, itemBundleStart, lexInsideFilters)
 	}
@@ -239,7 +240,7 @@ func lexInsideFilters(l *lexer) stateFn {
 	return lexFilterValue
 }
 
-func lexFilterValue(l *lexer) stateFn {
+func lexFilterValue(l *lexer) lexerStateFn {
 	next := l.peek()
 
 	if strings.IndexRune(tokenValidNumberStart, next) >= 0 {
@@ -254,7 +255,7 @@ func lexFilterValue(l *lexer) stateFn {
 	return l.errorf("expected filter value, got %s", l.input[l.start:])
 }
 
-func lexStringValue(l *lexer) stateFn {
+func lexStringValue(l *lexer) lexerStateFn {
 	for {
 		found := l.acceptRunUntil('\\', '"')
 		if !found {
@@ -288,7 +289,7 @@ func lexStringValue(l *lexer) stateFn {
 	}
 }
 
-func lexNumberValue(l *lexer) stateFn {
+func lexNumberValue(l *lexer) lexerStateFn {
 	l.accept("+-")
 
 	// We can only have one decimal dot
@@ -312,7 +313,7 @@ func lexNumberValue(l *lexer) stateFn {
 	return lexAfterFilterValue
 }
 
-func lexAfterFilterValue(l *lexer) stateFn {
+func lexAfterFilterValue(l *lexer) lexerStateFn {
 	next := l.next()
 	switch string(next) {
 	case tokenOr:
@@ -332,11 +333,11 @@ func lexAfterFilterValue(l *lexer) stateFn {
 	return lexInsideFilters
 }
 
-func lexAfterFilter(l *lexer) stateFn {
+func lexAfterFilter(l *lexer) lexerStateFn {
 	next := l.next()
 
 	if next == eof {
-		l.emit(itemEof)
+		l.emit(itemEOF)
 		return nil
 	}
 
@@ -355,15 +356,15 @@ func lexAfterFilter(l *lexer) stateFn {
 	return lexFilters
 }
 
-func lexToken(tv string, it itemType, next stateFn) func(l *lexer) stateFn {
-	return func(l *lexer) stateFn {
+func lexToken(tv string, it itemType, next lexerStateFn) func(l *lexer) lexerStateFn {
+	return func(l *lexer) lexerStateFn {
 		l.pos += len(tv)
 		l.emit(it)
 		return next
 	}
 }
 
-func (l *lexer) errorf(format string, args ...interface{}) stateFn {
+func (l *lexer) errorf(format string, args ...interface{}) lexerStateFn {
 	l.items <- item{
 		itemError,
 		fmt.Sprintf(format, args...),
@@ -394,29 +395,6 @@ const (
 	expressionTypeCt
 )
 
-type parserState int
-
-const (
-	parserStateInitial parserState = iota
-
-	parserStateReadingPath
-	parserStateReadingExpression
-	parserStateReadingExpressionValue
-
-	parserStateAfterPath
-	parserStateAfterFilter
-	parserStateAfterExpression
-)
-
-type parser struct {
-	state parserState
-
-	filterOperatorStack []*filterOperator
-	filterItems         []filterItem
-
-	expressionOperatorStack []*expressionOperator
-}
-
 type filterItem interface {
 	isFilterItem()
 }
@@ -431,8 +409,8 @@ func (f *filterOperand) isFilterItem() {}
 type filterOperatorType int
 
 const (
-	filterOperatorTypeAnd filterOperatorType = iota
-	filterOperatorTypeOr
+	filterOperatorTypeOr filterOperatorType = iota
+	filterOperatorTypeAnd
 	filterOperatorTypeBundleStart
 	filterOperatorTypeBundleEnd
 )
@@ -452,11 +430,10 @@ type expressionOperatorType int
 
 const (
 	expressionValueTypeString expressionValueType = iota
-	expressionValueTypeInt
-	expressionValueTypeFloat
+	expressionValueTypeNumber
 
-	expressionOperatorTypeAnd expressionOperatorType = iota
-	expressionOperatorTypeOr
+	expressionOperatorTypeOr expressionOperatorType = iota
+	expressionOperatorTypeAnd
 	expressionOperatorTypeBundleStart
 	expressionOperatorTypeBundleEnd
 )
@@ -488,8 +465,8 @@ func (p *parser) pushFilterOperator(f *filterOperator) {
 	p.filterOperatorStack = append(p.filterOperatorStack, f)
 }
 
-func (p *parser) pushFilterItem(f filterItem) {
-	p.filterItems = append(p.filterItems, f)
+func (p *parser) pushFilterItems(f ...filterItem) {
+	p.filterItems = append(p.filterItems, f...)
 }
 
 func (p *parser) popExpressionOperator() *expressionOperator {
@@ -588,40 +565,6 @@ func (i item) toExpressionType() expressionType {
 	return expressionTypeEq
 }
 
-func (i item) toExpressionValueType() expressionValueType {
-	switch i.ItemType {
-	case itemNumber:
-		if strings.LastIndex(i.Value, ".") > 0 {
-			return expressionValueTypeFloat
-		}
-
-		return expressionValueTypeInt
-	case itemString:
-		return expressionValueTypeString
-	}
-
-	return expressionValueTypeString
-}
-
-func (i item) toExpressionValue() interface{} {
-	switch i.ItemType {
-	case itemNumber:
-		if strings.LastIndex(i.Value, ".") > 0 {
-			// TODO: Handle this error
-			num, _ := strconv.ParseFloat(i.Value, 32)
-			return num
-		}
-
-		// TODO: Handle this error
-		num, _ := strconv.Atoi(i.Value)
-		return num
-	case itemString:
-		return i.Value
-	}
-
-	return expressionValueTypeString
-}
-
 func (i item) toFilterOperator() *filterOperator {
 	var operatorType filterOperatorType
 	switch i.ItemType {
@@ -658,140 +601,217 @@ func (i item) toExpressionOperator() *expressionOperator {
 	}
 }
 
-func parse(items chan item) {
-	p := &parser{
-		state: parserStateInitial,
-	}
+type parser struct {
+	filterOperatorStack     []*filterOperator
+	expressionOperatorStack []*expressionOperator
+	done                    chan bool
+	items                   <-chan item
 
-ParseLoop:
-	for {
-		i := <-items
-
-		switch i.ItemType {
-		case itemPath:
-			p.pushFilterItem(&filterOperand{
-				path:            i.Value,
-				expressionItems: []expressionItem{},
-			})
-
-			p.state = parserStateAfterPath
-
-		case itemFiltersStart:
-			p.state = parserStateReadingExpression
-
-		case itemFilterEq, itemFilterLt, itemFilterLte, itemFilterGt, itemFilterGte, itemFilterCt:
-			p.pushExpressionItem(&expressionOperand{
-				expressionType: i.toExpressionType(),
-			})
-
-			p.state = parserStateReadingExpressionValue
-
-		case itemString, itemNumber:
-			top := p.currentExpressionOperand()
-			top.valueType = i.toExpressionValueType()
-			top.value = i.toExpressionValue()
-
-			p.state = parserStateAfterExpression
-
-		case itemFiltersEnd:
-			for op := p.popExpressionOperator(); op != nil; op = p.popExpressionOperator() {
-				if op.operatorType > expressionOperatorTypeOr {
-					panic("filter bracket mismatch")
-				}
-
-				p.pushExpressionItem(op)
-			}
-
-			p.state = parserStateAfterFilter
-
-		case itemAnd, itemOr:
-			if p.state == parserStateAfterFilter {
-				op := i.toFilterOperator()
-				for t := p.topFilterOperator(); t != nil && op.operatorType > t.operatorType; t = p.topFilterOperator() {
-					p.pushFilterItem(p.popFilterOperator())
-				}
-
-				p.pushFilterOperator(op)
-
-				p.state = parserStateReadingPath
-			} else if p.state == parserStateAfterExpression {
-				op := i.toExpressionOperator()
-				for t := p.topExpressionOperator(); t != nil && op.operatorType > t.operatorType; t = p.topExpressionOperator() {
-					p.pushExpressionItem(p.popExpressionOperator())
-				}
-
-				p.pushExpressionOperator(op)
-
-				p.state = parserStateReadingExpression
-			}
-
-		case itemBundleStart:
-			if p.state == parserStateInitial || p.state == parserStateReadingPath {
-				p.pushFilterOperator(i.toFilterOperator())
-			} else if p.state == parserStateReadingExpression {
-				p.pushExpressionOperator(i.toExpressionOperator())
-			}
-
-		case itemBundleEnd:
-			if p.state == parserStateAfterFilter {
-				openingBracketFound := false
-				for op := p.popFilterOperator(); op != nil; op = p.popFilterOperator() {
-					if op.operatorType == filterOperatorTypeBundleStart {
-						openingBracketFound = true
-						break
-					}
-
-					if op.operatorType == filterOperatorTypeBundleEnd {
-						panic("filter bundle mismatch")
-					}
-
-					p.pushFilterItem(op)
-				}
-
-				if !openingBracketFound {
-					panic("filter bundle mismatch")
-				}
-			} else if p.state == parserStateAfterExpression {
-				openingBracketFound := false
-				for op := p.popExpressionOperator(); op != nil; op = p.popExpressionOperator() {
-					if op.operatorType == expressionOperatorTypeBundleStart {
-						openingBracketFound = true
-						break
-					}
-
-					if op.operatorType == expressionOperatorTypeBundleEnd {
-						panic("filter bundle mismatch")
-					}
-
-					p.pushExpressionItem(op)
-				}
-
-				if !openingBracketFound {
-					panic("filter bundle mismatch")
-				}
-			}
-
-		case itemEof:
-			for op := p.popFilterOperator(); op != nil; op = p.popFilterOperator() {
-				if op.operatorType > filterOperatorTypeOr {
-					panic("filter bracket mismatch")
-				}
-
-				p.pushFilterItem(op)
-			}
-
-			break ParseLoop
-
-		default:
-			fmt.Printf("unimplemented: %v\n", i)
-		}
-	}
-
-	p.printResult()
+	filterItems []filterItem
+	err         error
 }
 
-func (p *parser) printResult() {
-	for _, f := range p.filterItems {
+func (p *parser) errorf(format string, args ...interface{}) parserStateFn {
+	p.err = fmt.Errorf(format, args...)
+	return nil
+}
+
+func (p *parser) run() {
+	for state := parseFilters; state != nil; {
+		state = state(p)
+	}
+
+	p.done <- true
+}
+
+func parse(items <-chan item, lexerDone <-chan bool) ([]filterItem, error) {
+	p := parser{
+		items:                   items,
+		filterOperatorStack:     []*filterOperator{},
+		expressionOperatorStack: []*expressionOperator{},
+		done:                    make(chan bool),
+		filterItems:             []filterItem{},
+	}
+
+	go p.run()
+	<-lexerDone
+	<-p.done
+
+	return p.filterItems, p.err
+}
+
+func parseFilters(p *parser) parserStateFn {
+	next := <-p.items
+	if next.ItemType == itemBundleStart {
+		p.pushFilterOperator(&filterOperator{filterOperatorTypeBundleStart})
+		return parseFilters
+	}
+
+	if next.ItemType == itemPath {
+		p.pushFilterItems(&filterOperand{
+			path:            next.Value,
+			expressionItems: []expressionItem{},
+		})
+
+		return parseFilterType
+	}
+
+	return p.errorf("expected bundle start or path, got %s", next.ItemType.String())
+}
+
+func parseFilterType(p *parser) parserStateFn {
+	next := <-p.items
+	if next.ItemType == itemFiltersStart {
+		return parseExpression
+	}
+
+	return p.errorf("expected filters start, got %s", next.ItemType.String())
+}
+
+func parseExpression(p *parser) parserStateFn {
+	next := <-p.items
+	if next.ItemType == itemBundleStart {
+		p.pushExpressionItem(next.toExpressionOperator())
+		return parseExpression
+	}
+
+	expressionType := next.toExpressionType()
+
+	var value interface{}
+	var valueType expressionValueType
+
+	next = <-p.items
+	switch next.ItemType {
+	case itemString:
+		value = next.Value
+		valueType = expressionValueTypeString
+		break
+	case itemNumber:
+		num, err := strconv.ParseFloat(next.Value, 64)
+		if err != nil {
+			return p.errorf("failed to parse number: %s", err.Error())
+		}
+
+		value = num
+		valueType = expressionValueTypeNumber
+		break
+	default:
+		return p.errorf("expected string or number, got %s", next.ItemType.String())
+	}
+
+	p.pushExpressionItem(&expressionOperand{
+		expressionType: expressionType,
+		valueType:      valueType,
+		value:          value,
+	})
+
+	return parseAfterExpression
+}
+
+func parseAfterExpression(p *parser) parserStateFn {
+	next := <-p.items
+	if next.ItemType == itemFiltersEnd {
+		current := p.currentFilterOperand()
+		current.expressionItems = reverseExpressionOperators(p.expressionOperatorStack)
+		p.expressionOperatorStack = []*expressionOperator{}
+		return parseAfterFilter
+	}
+
+	if next.ItemType == itemOr || next.ItemType == itemAnd {
+		op := next.toExpressionOperator()
+		topExpression := p.topExpressionOperator()
+		for topExpression != nil && op.operatorType > topExpression.operatorType {
+			top := p.popExpressionOperator()
+			p.pushExpressionItem(top)
+			topExpression = p.topExpressionOperator()
+		}
+
+		p.pushExpressionOperator(op)
+		return parseExpression
+	}
+
+	if next.ItemType == itemBundleEnd {
+		op := p.popExpressionOperator()
+		for op != nil {
+			if op.operatorType == expressionOperatorTypeBundleStart {
+				break
+			}
+
+			p.pushExpressionItem(op)
+			op = p.popExpressionOperator()
+		}
+
+		return parseAfterExpression
+	}
+
+	return p.errorf("expected filters end, or/and or bundle end, got %s", next.ItemType.String())
+}
+
+func parseAfterFilter(p *parser) parserStateFn {
+	next := <-p.items
+	if next.ItemType == itemEOF {
+		items := reverseFilterOperators(p.filterOperatorStack)
+		p.pushFilterItems(items...)
+		p.filterOperatorStack = []*filterOperator{}
+		return nil
+	}
+
+	if next.ItemType == itemOr || next.ItemType == itemAnd {
+		op := next.toFilterOperator()
+		topFilter := p.topFilterOperator()
+		for topFilter != nil && op.operatorType > topFilter.operatorType {
+			top := p.popFilterOperator()
+			p.pushFilterItems(top)
+			topFilter = p.topFilterOperator()
+		}
+
+		p.pushFilterOperator(op)
+		return parseFilters
+	}
+
+	if next.ItemType == itemBundleEnd {
+		op := p.popFilterOperator()
+		for op != nil {
+			if op.operatorType == filterOperatorTypeBundleStart {
+				break
+			}
+
+			p.pushFilterItems(op)
+			op = p.popFilterOperator()
+		}
+
+		return parseAfterFilter
+	}
+
+	return p.errorf("expected eof, or/and or bundle end, got %s", next.ItemType.String())
+}
+
+func reverseExpressionOperators(items []*expressionOperator) []expressionItem {
+	itemsLen := len(items)
+	result := make([]expressionItem, itemsLen)
+
+	for i, item := range items {
+		itemCopy := *item
+		result[itemsLen-i-1] = &itemCopy
+	}
+
+	return result
+}
+
+func reverseFilterOperators(items []*filterOperator) []filterItem {
+	itemsLen := len(items)
+	result := make([]filterItem, itemsLen)
+
+	for i, item := range items {
+		itemCopy := *item
+		result[itemsLen-i-1] = &itemCopy
+	}
+
+	return result
+}
+
+func printResult(items []filterItem) {
+	for _, f := range items {
 		switch f.(type) {
 		case *filterOperand:
 			fmt.Printf("filter { ")
@@ -820,7 +840,10 @@ func main() {
 	testString := `name.first[eq:"foo"|eq:"bar"]|email[ct:"foo",ct:"bar"],age[(gt:4.5,lt:-10)|eq:15]`
 
 	l := lex(testString)
-	parse(l.items)
+	result, err := parse(l.items, l.done)
+	if err != nil {
+		fmt.Printf("error parsing: %s", err.Error())
+	}
 
-	<-l.done
+	printResult(result)
 }
