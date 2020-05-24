@@ -112,23 +112,25 @@ type item struct {
 }
 
 type lexer struct {
-	input string
-	items chan item
-	done  chan bool
-	width int
-	start int
-	pos   int
+	input  string
+	items  chan item
+	done   chan bool
+	width  int
+	start  int
+	pos    int
+	cancel chan bool
 }
 
 func (l *lexer) run() {
-	for state := lexFilters; state != nil; {
+	state := lexFilters
+	for state != nil {
 		state = state(l)
 	}
 
 	l.done <- true
 }
 
-func (l *lexer) emit(t itemType) {
+func (l *lexer) emit(t itemType) bool {
 	value := l.input[l.start:l.pos]
 
 	// If we got a string, we need to clear escaped characters
@@ -137,8 +139,13 @@ func (l *lexer) emit(t itemType) {
 		value = strings.ReplaceAll(value, `\"`, `"`)
 	}
 
-	l.items <- item{t, value}
-	l.start = l.pos
+	select {
+	case l.items <- item{t, value}:
+		l.start = l.pos
+		return true
+	case <-l.cancel:
+		return false
+	}
 }
 
 func (l *lexer) next() (r rune) {
@@ -209,7 +216,9 @@ func lexFilters(l *lexer) lexerStateFn {
 		return l.errorf("expected path, got: %s", l.input[l.start:])
 	}
 
-	l.emit(itemPath)
+	if !l.emit(itemPath) {
+		return nil
+	}
 
 	if string(l.peek()) != tokenFiltersStart {
 		return l.errorf("expected filters start, got: %s", l.input[l.start:])
@@ -226,7 +235,9 @@ func lexInsideFilters(l *lexer) lexerStateFn {
 	l.acceptRun(tokenValidFilterType)
 	nextFilter := l.input[l.start:l.pos]
 	if filterType, ok := filterTypes[nextFilter]; ok {
-		l.emit(filterType)
+		if !l.emit(filterType) {
+			return nil
+		}
 	} else {
 		return l.errorf("expected filter type, got %s", nextFilter)
 	}
@@ -265,7 +276,9 @@ func lexStringValue(l *lexer) lexerStateFn {
 		// If the next rune is only ", the string is closed
 		next := l.peek()
 		if next == '"' {
-			l.emit(itemString)
+			if !l.emit(itemString) {
+				return nil
+			}
 
 			// Skip the closing quotes
 			l.next()
@@ -309,7 +322,10 @@ func lexNumberValue(l *lexer) lexerStateFn {
 		l.acceptRun(tokenValidNumberDigit)
 	}
 
-	l.emit(itemNumber)
+	if !l.emit(itemNumber) {
+		return nil
+	}
+
 	return lexAfterFilterValue
 }
 
@@ -317,9 +333,13 @@ func lexAfterFilterValue(l *lexer) lexerStateFn {
 	next := l.next()
 	switch string(next) {
 	case tokenOr:
-		l.emit(itemOr)
+		if !l.emit(itemOr) {
+			return nil
+		}
 	case tokenAnd:
-		l.emit(itemAnd)
+		if !l.emit(itemAnd) {
+			return nil
+		}
 	case tokenFiltersEnd:
 		l.backup()
 		return lexToken(tokenFiltersEnd, itemFiltersEnd, lexAfterFilter)
@@ -337,15 +357,21 @@ func lexAfterFilter(l *lexer) lexerStateFn {
 	next := l.next()
 
 	if next == eof {
-		l.emit(itemEOF)
+		if !l.emit(itemEOF) {
+			return nil
+		}
 		return nil
 	}
 
 	switch string(next) {
 	case tokenOr:
-		l.emit(itemOr)
+		if !l.emit(itemOr) {
+			return nil
+		}
 	case tokenAnd:
-		l.emit(itemAnd)
+		if !l.emit(itemAnd) {
+			return nil
+		}
 	case tokenBundleEnd:
 		l.backup()
 		return lexToken(tokenBundleEnd, itemBundleEnd, lexAfterFilter)
@@ -359,7 +385,9 @@ func lexAfterFilter(l *lexer) lexerStateFn {
 func lexToken(tv string, it itemType, next lexerStateFn) func(l *lexer) lexerStateFn {
 	return func(l *lexer) lexerStateFn {
 		l.pos += len(tv)
-		l.emit(it)
+		if !l.emit(it) {
+			return nil
+		}
 		return next
 	}
 }
@@ -375,9 +403,10 @@ func (l *lexer) errorf(format string, args ...interface{}) lexerStateFn {
 
 func lex(input string) *lexer {
 	l := &lexer{
-		input: input,
-		items: make(chan item),
-		done:  make(chan bool),
+		input:  input,
+		items:  make(chan item, 5),
+		done:   make(chan bool, 1),
+		cancel: make(chan bool, 1),
 	}
 
 	go l.run()
@@ -394,6 +423,25 @@ const (
 	expressionTypeLte
 	expressionTypeCt
 )
+
+func (e *expressionType) String() string {
+	switch *e {
+	case expressionTypeEq:
+		return "eq"
+	case expressionTypeGt:
+		return "gt"
+	case expressionTypeGte:
+		return "gte"
+	case expressionTypeLt:
+		return "lt"
+	case expressionTypeLte:
+		return "lte"
+	case expressionTypeCt:
+		return "ct"
+	default:
+		return "et"
+	}
+}
 
 type filterItem interface {
 	isFilterItem()
@@ -414,6 +462,21 @@ const (
 	filterOperatorTypeBundleStart
 	filterOperatorTypeBundleEnd
 )
+
+func (f *filterOperatorType) String() string {
+	switch *f {
+	case filterOperatorTypeOr:
+		return "or"
+	case filterOperatorTypeAnd:
+		return "and"
+	case filterOperatorTypeBundleStart:
+		return "bundleStart"
+	case filterOperatorTypeBundleEnd:
+		return "bundleEnd"
+	default:
+		return "fop"
+	}
+}
 
 type filterOperator struct {
 	operatorType filterOperatorType
@@ -437,6 +500,21 @@ const (
 	expressionOperatorTypeBundleStart
 	expressionOperatorTypeBundleEnd
 )
+
+func (e *expressionOperatorType) String() string {
+	switch *e {
+	case expressionOperatorTypeOr:
+		return "or"
+	case expressionOperatorTypeAnd:
+		return "and"
+	case expressionOperatorTypeBundleStart:
+		return "bundleStart"
+	case expressionOperatorTypeBundleEnd:
+		return "bundleEnd"
+	default:
+		return "eop"
+	}
+}
 
 type expressionOperand struct {
 	expressionType expressionType
@@ -606,6 +684,7 @@ type parser struct {
 	expressionOperatorStack []*expressionOperator
 	done                    chan bool
 	items                   <-chan item
+	cancelLexer             chan<- bool
 
 	filterItems []filterItem
 	err         error
@@ -613,24 +692,27 @@ type parser struct {
 
 func (p *parser) errorf(format string, args ...interface{}) parserStateFn {
 	p.err = fmt.Errorf(format, args...)
+	p.cancelLexer <- true
 	return nil
 }
 
 func (p *parser) run() {
-	for state := parseFilters; state != nil; {
+	state := parseFilters
+	for state != nil {
 		state = state(p)
 	}
 
 	p.done <- true
 }
 
-func parse(items <-chan item, lexerDone <-chan bool) ([]filterItem, error) {
+func parse(items <-chan item, lexerDone <-chan bool, cancelLexer chan<- bool) ([]filterItem, error) {
 	p := parser{
 		items:                   items,
 		filterOperatorStack:     []*filterOperator{},
 		expressionOperatorStack: []*expressionOperator{},
-		done:                    make(chan bool),
+		done:                    make(chan bool, 1),
 		filterItems:             []filterItem{},
+		cancelLexer:             cancelLexer,
 	}
 
 	go p.run()
@@ -671,7 +753,7 @@ func parseFilterType(p *parser) parserStateFn {
 func parseExpression(p *parser) parserStateFn {
 	next := <-p.items
 	if next.ItemType == itemBundleStart {
-		p.pushExpressionItem(next.toExpressionOperator())
+		p.pushExpressionOperator(next.toExpressionOperator())
 		return parseExpression
 	}
 
@@ -712,7 +794,12 @@ func parseAfterExpression(p *parser) parserStateFn {
 	next := <-p.items
 	if next.ItemType == itemFiltersEnd {
 		current := p.currentFilterOperand()
-		current.expressionItems = reverseExpressionOperators(p.expressionOperatorStack)
+		operators := reverseExpressionOperators(p.expressionOperatorStack)
+		if hasOpenExpressionBundle(operators) {
+			return p.errorf("found open expression bundle")
+		}
+
+		current.expressionItems = append(current.expressionItems, operators...)
 		p.expressionOperatorStack = []*expressionOperator{}
 		return parseAfterFilter
 	}
@@ -731,14 +818,20 @@ func parseAfterExpression(p *parser) parserStateFn {
 	}
 
 	if next.ItemType == itemBundleEnd {
+		startFound := false
 		op := p.popExpressionOperator()
 		for op != nil {
 			if op.operatorType == expressionOperatorTypeBundleStart {
+				startFound = true
 				break
 			}
 
 			p.pushExpressionItem(op)
 			op = p.popExpressionOperator()
+		}
+
+		if !startFound {
+			return p.errorf("no bundle start found for end")
 		}
 
 		return parseAfterExpression
@@ -750,8 +843,12 @@ func parseAfterExpression(p *parser) parserStateFn {
 func parseAfterFilter(p *parser) parserStateFn {
 	next := <-p.items
 	if next.ItemType == itemEOF {
-		items := reverseFilterOperators(p.filterOperatorStack)
-		p.pushFilterItems(items...)
+		operators := reverseFilterOperators(p.filterOperatorStack)
+		if hasOpenFilterBundle(operators) {
+			return p.errorf("found open filter bundle")
+		}
+
+		p.pushFilterItems(operators...)
 		p.filterOperatorStack = []*filterOperator{}
 		return nil
 	}
@@ -770,14 +867,20 @@ func parseAfterFilter(p *parser) parserStateFn {
 	}
 
 	if next.ItemType == itemBundleEnd {
+		startFound := false
 		op := p.popFilterOperator()
 		for op != nil {
 			if op.operatorType == filterOperatorTypeBundleStart {
+				startFound = true
 				break
 			}
 
 			p.pushFilterItems(op)
 			op = p.popFilterOperator()
+		}
+
+		if !startFound {
+			return p.errorf("no bundle start found for end")
 		}
 
 		return parseAfterFilter
@@ -810,20 +913,50 @@ func reverseFilterOperators(items []*filterOperator) []filterItem {
 	return result
 }
 
+func hasOpenExpressionBundle(items []expressionItem) bool {
+	for _, item := range items {
+		op, ok := item.(*expressionOperator)
+		if !ok {
+			continue
+		}
+
+		if op.operatorType == expressionOperatorTypeBundleStart {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasOpenFilterBundle(items []filterItem) bool {
+	for _, item := range items {
+		op, ok := item.(*filterOperator)
+		if !ok {
+			continue
+		}
+
+		if op.operatorType == filterOperatorTypeBundleStart {
+			return true
+		}
+	}
+
+	return false
+}
+
 func printResult(items []filterItem) {
 	for _, f := range items {
 		switch f.(type) {
 		case *filterOperand:
-			fmt.Printf("filter { ")
+			fmt.Printf("filter{ ")
 			op := f.(*filterOperand)
 			for _, e := range op.expressionItems {
 				switch e.(type) {
 				case *expressionOperand:
 					eop := e.(*expressionOperand)
-					fmt.Printf("e(%d %v) ", eop.expressionType, eop.value)
+					fmt.Printf("e(%s %v) ", eop.expressionType.String(), eop.value)
 				case *expressionOperator:
 					eop := e.(*expressionOperator)
-					fmt.Printf("op(%d) ", eop.operatorType)
+					fmt.Printf("op(%s) ", eop.operatorType.String())
 				}
 			}
 
@@ -831,16 +964,16 @@ func printResult(items []filterItem) {
 
 		case *filterOperator:
 			op := f.(*filterOperator)
-			fmt.Printf("fop(%d) ", op.operatorType)
+			fmt.Printf("fop(%s) ", op.operatorType.String())
 		}
 	}
 }
 
 func main() {
-	testString := `name.first[eq:"foo"|eq:"bar"]|email[ct:"foo",ct:"bar"],age[(gt:4.5,lt:-10)|eq:15]`
+	testString := `(name.first[eq:"foo"|eq:"bar"]|email[ct:"foo",ct:"bar"]),age[(gt:4.5,lt:-10)|eq:15]`
 
 	l := lex(testString)
-	result, err := parse(l.items, l.done)
+	result, err := parse(l.items, l.done, l.cancel)
 	if err != nil {
 		fmt.Printf("error parsing: %s", err.Error())
 	}
